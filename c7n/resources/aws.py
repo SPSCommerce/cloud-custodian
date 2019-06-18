@@ -14,13 +14,14 @@
 
 from c7n.provider import clouds
 
-from collections import Counter
+from collections import Counter, namedtuple
 import contextlib
 import copy
 import datetime
 import itertools
 import logging
 import os
+import operator
 import shutil
 import sys
 import tempfile
@@ -29,8 +30,11 @@ import traceback
 
 import boto3
 
+from botocore.validate import ParamValidator
+
 from c7n.credentials import SessionFactory
 from c7n.config import Bag
+from c7n.exceptions import PolicyValidationError
 from c7n.log import CloudWatchLogHandler
 
 # Import output registries aws provider extends.
@@ -116,6 +120,35 @@ def _default_account_id(options):
         options.account_id = None
 
 
+def shape_validate(params, shape_name, service):
+    session = fake_session()._session
+    model = session.get_service_model(service)
+    shape = model.shape_for(shape_name)
+    validator = ParamValidator()
+    report = validator.validate(params, shape)
+    if report.has_errors():
+        raise PolicyValidationError(report.generate_report())
+
+
+class Arn(namedtuple('_Arn', (
+        'arn', 'partition', 'service', 'region',
+        'account_id', 'resource', 'resource_type'))):
+
+    __slots__ = ()
+
+    @classmethod
+    def parse(cls, arn):
+        parts = arn.split(':', 5)
+        # a few resources use qualifiers without specifying type
+        if parts[2] in ('s3', 'apigateway', 'execute-api'):
+            parts.append(None)
+        elif '/' in parts[-1]:
+            parts.extend(reversed(parts.pop(-1).split('/', 1)))
+        elif ':' in parts[-1]:
+            parts.extend(reversed(parts.pop(-1).split(':', 1)))
+        return cls(*parts)
+
+
 @metrics_outputs.register('aws')
 class MetricsOutput(Metrics):
     """Send metrics data to cloudwatch
@@ -127,6 +160,10 @@ class MetricsOutput(Metrics):
     def __init__(self, ctx, config=None):
         super(MetricsOutput, self).__init__(ctx, config)
         self.namespace = self.config.get('namespace', DEFAULT_NAMESPACE)
+        self.region = self.config.get('region')
+        self.destination = (
+            self.config.scheme == 'aws' and
+            self.config.get('netloc') == 'master') and 'master' or None
 
     def _format_metric(self, key, value, unit, dimensions):
         d = {
@@ -138,11 +175,25 @@ class MetricsOutput(Metrics):
             {"Name": "Policy", "Value": self.ctx.policy.name},
             {"Name": "ResType", "Value": self.ctx.policy.resource_type}]
         for k, v in dimensions.items():
+            # Skip legacy static dimensions if using new capabilities
+            if (self.destination or self.region) and k == 'Scope':
+                continue
             d['Dimensions'].append({"Name": k, "Value": v})
+        if self.region:
+            d['Dimensions'].append(
+                {'Name': 'Region', 'Value': self.ctx.options.region})
+        if self.destination:
+            d['Dimensions'].append(
+                {'Name': 'Account', 'Value': self.ctx.options.account_id or ''})
         return d
 
     def _put_metrics(self, ns, metrics):
-        watch = utils.local_session(self.ctx.session_factory).client('cloudwatch')
+        if self.destination == 'master':
+            watch = self.ctx.session_factory(
+                assume=False).client('cloudwatch', region_name=self.region)
+        else:
+            watch = utils.local_session(
+                self.ctx.session_factory).client('cloudwatch', region_name=self.region)
         return self.retry(
             watch.put_metric_data, Namespace=ns, MetricData=metrics)
 
@@ -215,14 +266,14 @@ class XrayTracer(object):
     use_daemon = 'AWS_XRAY_DAEMON_ADDRESS' in os.environ
     service_name = 'custodian'
 
-    context = XrayContext()
-    if HAVE_XRAY:
+    @classmethod
+    def initialize(cls):
+        context = XrayContext()
         xray_recorder.configure(
-            emitter=use_daemon is False and emitter or None,
+            emitter=cls.use_daemon is False and cls.emitter or None,
             context=context,
             sampling=True,
-            context_missing='LOG_ERROR'
-        )
+            context_missing='LOG_ERROR')
         patch(['boto3', 'requests'])
         logging.getLogger('aws_xray_sdk.core').setLevel(logging.ERROR)
 
@@ -296,10 +347,14 @@ class ApiStats(DeltaStats):
     def __exit__(self, exc_type=None, exc_value=None, exc_traceback=None):
         if isinstance(self.ctx.session_factory, credentials.SessionFactory):
             self.ctx.session_factory.set_subscribers(())
+
+        # With cached sessions, we need to unregister any events subscribers
+        # on extant sessions to allow for the next registration.
+        utils.local_session(self.ctx.session_factory).events.unregister(
+            'after-call.*.*', self._record, unique_id='c7n-api-stats')
+
         self.ctx.metrics.put_metric(
             "ApiCalls", sum(self.api_calls.values()), "Count")
-        self.ctx.policy._write_file(
-            'api-stats.json', utils.dumps(dict(self.api_calls)))
         self.pop_snapshot()
 
     def __call__(self, s):
@@ -308,8 +363,7 @@ class ApiStats(DeltaStats):
 
     def _record(self, http_response, parsed, model, **kwargs):
         self.api_calls["%s.%s" % (
-            model.service_model.endpoint_prefix,
-            model.name)] += 1
+            model.service_model.endpoint_prefix, model.name)] += 1
 
 
 @blob_outputs.register('s3')
@@ -357,7 +411,6 @@ class S3Output(DirectoryOutput):
         if exc_type is not None:
             log.exception("Error while executing policy")
         log.debug("Uploading policy logs")
-        self.leave_log()
         self.compress()
         self.transfer = S3Transfer(
             self.ctx.session_factory(assume=False).client('s3'))
@@ -392,6 +445,9 @@ class AWS(object):
         """
         _default_region(options)
         _default_account_id(options)
+        if options.tracer and options.tracer.startswith('xray') and HAVE_XRAY:
+            XrayTracer.initialize()
+
         return options
 
     def get_session_factory(self, options):
@@ -419,8 +475,12 @@ class AWS(object):
             options.regions, policy_collection.resource_types)
 
         for p in policy_collection:
+            if 'aws.' in p.resource_type:
+                _, resource_type = p.resource_type.split('.', 1)
+            else:
+                resource_type = p.resource_type
             available_regions = service_region_map.get(
-                resource_service_map.get(p.resource_type), ())
+                resource_service_map.get(resource_type), ())
 
             # its a global service/endpoint, use user provided region
             # or us-east-1.
@@ -452,15 +512,27 @@ class AWS(object):
                 policies.append(
                     Policy(p.data, options_copy,
                            session_factory=policy_collection.session_factory()))
-        return PolicyCollection(policies, options)
+
+        return PolicyCollection(
+            # order policies by region to minimize local session invalidation.
+            # note relative ordering of policies must be preserved, python sort
+            # is stable.
+            sorted(policies, key=operator.attrgetter('options.region')),
+            options)
 
 
-def get_service_region_map(regions, resource_types):
-    # we're not interacting with the apis just using the sdk meta information.
+def fake_session():
     session = boto3.Session(
         region_name='us-east-1',
         aws_access_key_id='never',
         aws_secret_access_key='found')
+    return session
+
+
+def get_service_region_map(regions, resource_types):
+    # we're not interacting with the apis just using the sdk meta information.
+
+    session = fake_session()
     normalized_types = []
     for r in resource_types:
         if r.startswith('aws.'):

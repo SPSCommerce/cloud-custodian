@@ -91,6 +91,7 @@ def specific_error(error):
         return error
 
     r = t = None
+
     if isinstance(error.instance, dict):
         t = error.instance.get('type')
         r = error.instance.get('resource')
@@ -100,6 +101,7 @@ def specific_error(error):
         for idx, v in enumerate(error.validator_value):
             if v['$ref'].rsplit('/', 2)[1].endswith(r):
                 found = idx
+                break
         if found is not None:
             # error context is a flat list of all validation
             # failures, we have to index back to the policy
@@ -114,22 +116,20 @@ def specific_error(error):
     if t is not None:
         found = None
         for idx, v in enumerate(error.validator_value):
-            if '$ref' in v and v['$ref'].endswith(t):
+            if '$ref' in v and v['$ref'].rsplit('/', 2)[-1] == t:
                 found = idx
+                break
+            elif 'type' in v and t in v['properties']['type']['enum']:
+                found = idx
+                break
+
         if found is not None:
-            # Try to walk back an element/type ref to the specific
-            # error
-            spath = list(error.context[0].absolute_schema_path)
-            spath.reverse()
-            slen = len(spath)
-            if 'oneOf' in spath:
-                idx = spath.index('oneOf')
-            elif 'anyOf' in spath:
-                idx = spath.index('anyOf')
-            vidx = slen - idx
             for e in error.context:
-                if e.absolute_schema_path[vidx] == found:
-                    return e
+                for el in reversed(e.absolute_schema_path):
+                    if isinstance(el, int):
+                        if el == found:
+                            return e
+                        break
     return error
 
 
@@ -190,7 +190,10 @@ def generate(resource_types=()):
                 'start': {'format': 'date-time'},
                 'end': {'format': 'date-time'},
                 'resource': {'type': 'string'},
-                'max-resources': {'type': 'integer', 'minimum': 1},
+                'max-resources': {'anyOf': [
+                    {'type': 'integer', 'minimum': 1},
+                    {'$ref': '#/definitions/max-resources-properties'}
+                ]},
                 'max-resources-percent': {'type': 'number', 'minimum': 0, 'maximum': 100},
                 'comment': {'type': 'string'},
                 'comments': {'type': 'string'},
@@ -210,16 +213,23 @@ def generate(resource_types=()):
                 # generalize server side query mechanisms, currently
                 # this only for ec2 instance queries. limitations
                 # in json schema inheritance prevent us from doing this
-                # on a type specific basis http://goo.gl/8UyRvQ
+                # on a type specific basis
+                # https://stackoverflow.com/questions/22689900/json-schema-allof-with-additionalproperties
                 'query': {
-                    'type': 'array', 'items': {
-                        'type': 'object',
-                        'minProperties': 1,
-                        'maxProperties': 1}}
+                    'type': 'array', 'items': {'type': 'object'}}
+
             },
         },
         'policy-mode': {
             'anyOf': [e.schema for _, e in execution.items()],
+        },
+        'max-resources-properties': {
+            'type': 'object',
+            'properties': {
+                'amount': {"type": 'integer', 'minimum': 1},
+                'op': {'enum': ['or', 'and']},
+                'percent': {'type': 'number', 'minimum': 0, 'maximum': 100}
+            }
         }
     }
 
@@ -375,7 +385,7 @@ def resource_vocabulary(cloud_name=None, qualify_name=True):
                 resources[rname] = rtype
 
     for type_name, resource_type in resources.items():
-        classes = {'actions': {}, 'filters': {}}
+        classes = {'actions': {}, 'filters': {}, 'resource': resource_type}
         actions = []
         for action_name, cls in resource_type.action_registry.items():
             actions.append(action_name)
@@ -391,25 +401,40 @@ def resource_vocabulary(cloud_name=None, qualify_name=True):
             'actions': sorted(actions),
             'classes': classes,
         }
+
+    vocabulary["mode"] = {}
+    for mode_name, cls in execution.items():
+        vocabulary["mode"][mode_name] = cls
+
     return vocabulary
 
 
 def summary(vocabulary):
-    print("resource count: %d" % len(vocabulary))
-    action_count = filter_count = 0
+    providers = {}
+    non_providers = {}
 
-    common_actions = set(['notify', 'invoke-lambda'])
-    common_filters = set(['value', 'and', 'or', 'event'])
+    for type_name, rv in vocabulary.items():
+        if '.' not in type_name:
+            non_providers[type_name] = len(rv)
+        else:
+            provider, name = type_name.split('.', 1)
+            stats = providers.setdefault(provider, {
+                'resources': 0, 'actions': Counter(), 'filters': Counter()})
+            stats['resources'] += 1
+            for a in rv.get('actions'):
+                stats['actions'][a] += 1
+            for f in rv.get('filters'):
+                stats['filters'][f] += 1
 
-    for rv in vocabulary.values():
-        action_count += len(
-            set(rv.get('actions', ())).difference(common_actions))
-        filter_count += len(
-            set(rv.get('filters', ())).difference(common_filters))
-    print("unique actions: %d" % action_count)
-    print("common actions: %d" % len(common_actions))
-    print("unique filters: %d" % filter_count)
-    print("common filters: %s" % len(common_filters))
+    for provider, stats in providers.items():
+        print("%s:" % provider)
+        print(" resource count: %d" % stats['resources'])
+        print(" actions: %d" % len(stats['actions']))
+        print(" filters: %d" % len(stats['filters']))
+
+    for non_providers_type, length in non_providers.items():
+        print("%s:" % non_providers_type)
+        print(" count: %d" % length)
 
 
 def json_dump(resource=None):

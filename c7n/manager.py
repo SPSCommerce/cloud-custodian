@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from collections import deque
 import logging
 
 from c7n import cache
@@ -29,6 +30,9 @@ from c7n.utils import dumps
 
 
 class ResourceManager(object):
+    """
+    A Cloud Custodian resource
+    """
 
     filter_registry = None
     action_registry = None
@@ -114,3 +118,34 @@ class ResourceManager(object):
         """Returns the resource meta-model.
         """
         return self.query.resolve(self.resource_type)
+
+    def iter_filters(self, block_end=False):
+        queue = deque(self.filters)
+        while queue:
+            f = queue.popleft()
+            if f and f.type in ('or', 'and', 'not'):
+                if block_end:
+                    queue.appendleft(None)
+                for gf in f.filters:
+                    queue.appendleft(gf)
+            yield f
+
+    def validate(self):
+        """
+        Validates resource definition, does NOT validate filters, actions, modes.
+
+        Example use case: A resource type that requires an additional query
+
+        :example:
+
+        .. code-block:: yaml
+
+            policies:
+              - name: k8s-custom-resource
+                resource: k8s.custom-namespaced-resource
+                query:
+                  - version: v1
+                    group stable.example.com
+                    plural: crontabs
+        """
+        pass
